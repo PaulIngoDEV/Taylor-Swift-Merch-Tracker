@@ -1,0 +1,240 @@
+# 🛍️ Shopify Drop Tracker for Home Assistant
+
+Watches any Shopify store (example: the Taylor Swift Store) and sends a push notification as soon as **new products** appear or a product is **republished** (a drop). Each new product gets its own notification with image, price, availability and a direct link to the product page.
+
+- Python standard library only, no extra packages
+- Works with any shop that exposes `/products.json`
+- Notifications via **Pushover** and/or the **Home Assistant Companion App**
+- Exposes sensor attributes you can use for a Lovelace card
+
+> This project is not affiliated with Shopify or with any shop it can be pointed at. Please don't poll a shop too frequently (default: every 5 minutes).
+
+---
+
+## How it works
+
+1. The script loads all products from `https://<shop>/products.json` (with paging).
+2. It compares them with `known.json` (product ID → publication date).
+3. A product counts as **new** if its ID is not known yet **or** its `published_at` is more than 30 minutes later than last time (a re-drop).
+4. The result is returned as JSON to a `command_line` sensor. An automation reacts to new finds and sends the notifications.
+
+**Important:** On the very first run, all existing products are only stored as "known". No notification is sent. Only from the second run on does something count as new.
+
+---
+
+## Requirements
+
+- Home Assistant with access to `/config`
+- Optional: [Pushover](https://pushover.net/) (service `notify.pushover`)
+- Optional: Home Assistant Companion App
+- For Pushover images: the **Downloader** integration (see below)
+
+---
+
+## Installation
+
+### 1. Place the script
+
+Put the file `tswift_merch.py` here:
+
+```
+/config/scripts/tswift_merch.py
+```
+
+Set the shop at the top of the script:
+
+```python
+SHOP = "https://storeeu.taylorswift.com"
+```
+
+Other settings in the script:
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `NEW_HOURS` | How long a product is considered "NEW" | `48` |
+| `MAX_ITEMS` | Number of products in the sensor attribute (new ones are always included in full) | `36` |
+| `REPUBLISH_MINUTES` | A changed `published_at` beyond this difference counts as a re-drop | `30` |
+
+The script creates its own data files:
+
+```
+/config/tswift_merch/known.json   # products already seen
+/config/tswift_merch/latest.json  # last good state (fallback on errors)
+```
+
+### 2. Set up the sensor
+
+In `configuration.yaml`:
+
+```yaml
+command_line:
+  - sensor:
+      name: Taylor Swift Merch
+      unique_id: taylor_swift_merch
+      command: "python3 /config/scripts/tswift_merch.py"
+      scan_interval: 300
+      command_timeout: 60
+      unit_of_measurement: "new"
+      value_template: "{{ value_json.new_count | int(0) }}"
+      json_attributes:
+        - total_count
+        - last_check
+        - error
+        - new_since_last_run
+        - new_since_last_run_count
+        - products
+```
+
+Then check under *Developer tools → YAML → Check configuration* and reload the YAML configuration or restart Home Assistant.
+
+The sensor `sensor.taylor_swift_merch` provides these attributes:
+
+| Attribute | Content |
+|---|---|
+| `new_since_last_run` | Titles of the products that appeared in the last run |
+| `new_since_last_run_count` | Number of those |
+| `products` | List of products with title, URL, image, price, availability, `is_new` |
+| `total_count` | Total number of products in the shop |
+| `last_check` | Time of the last run |
+| `error` | Error message, empty if everything is fine |
+
+### 3. Pushover with images (optional)
+
+Pushover only accepts images as files, not as URLs. The automation therefore downloads the image first.
+
+1. Create the folder: `/config/tswift_merch/downloads`
+2. Add the **Downloader** integration (*Settings → Devices & services*) with exactly this directory.
+3. Allow the directory in `configuration.yaml`:
+
+   ```yaml
+   homeassistant:
+     allowlist_external_dirs:
+       - /config/tswift_merch/downloads
+   ```
+
+   If the `homeassistant:` block already exists, just add the new lines to it. Then **fully restart** Home Assistant. A YAML reload is not enough for this setting.
+
+Without this, you'll get the error `Attachment path … is not allowed`.
+
+### 4. Automation
+
+Replace `notify.mobile_app_YOUR_DEVICE` with your own service (find it under *Developer tools → Actions* by typing `notify.mobile_app`). If you don't use Pushover or the Companion App, remove the corresponding block.
+
+```yaml
+alias: 'Merch: New Products (Push)'
+description: Sends a notification for newly discovered merch products.
+triggers:
+  - trigger: state
+    entity_id: sensor.taylor_swift_merch
+    attribute: last_check
+conditions:
+  - condition: template
+    value_template: >-
+      {{ state_attr('sensor.taylor_swift_merch', 'new_since_last_run_count') |
+      int(0) > 0 }}
+actions:
+  - variables:
+      names: "{{ state_attr('sensor.taylor_swift_merch', 'new_since_last_run') or [] }}"
+      items: >-
+        {{ (state_attr('sensor.taylor_swift_merch', 'products') or [])
+           | selectattr('title', 'in', names) | list }}
+  - repeat:
+      for_each: "{{ items[:10] }}"
+      sequence:
+        # Companion App (iOS syntax; on Android use image + clickAction)
+        - action: notify.mobile_app_YOUR_DEVICE
+          data:
+            title: "🛍️ New: {{ repeat.item.title }}"
+            message: >-
+              {% set p = repeat.item.price_min -%}
+              {{ ('%.2f €' | format(p) ~ ' · ') if p is not none else '' }}{{ 'in stock' if repeat.item.available else 'sold out' }}
+            data:
+              url: "{{ repeat.item.url }}"
+              attachment:
+                url: "{{ repeat.item.image }}"
+                content-type: jpeg
+        # Pushover (image must be available locally)
+        - action: downloader.download_file
+          data:
+            url: "{{ repeat.item.image }}"
+            subdir: tswift
+            filename: product.jpg
+            overwrite: true
+        - delay: "00:00:03"
+        - action: notify.pushover
+          data:
+            title: "🛍️ New: {{ repeat.item.title }}"
+            message: >-
+              {% set p = repeat.item.price_min -%}
+              {{ ('%.2f €' | format(p) ~ ' · ') if p is not none else '' }}{{ 'in stock' if repeat.item.available else 'sold out' }}
+            data:
+              priority: 1
+              url: "{{ repeat.item.url }}"
+              url_title: Open product
+              attachment: /config/tswift_merch/downloads/tswift/product.jpg
+  - if:
+      - condition: template
+        value_template: "{{ items | count > 10 }}"
+    then:
+      - action: notify.mobile_app_YOUR_DEVICE
+        data:
+          title: "🛍️ Shop"
+          message: "… and {{ items | count - 10 }} more new products"
+          data:
+            url: https://YOUR-SHOP.example/collections/all
+      - action: notify.pushover
+        data:
+          title: "🛍️ Shop"
+          message: "… and {{ items | count - 10 }} more new products"
+          data:
+            url: https://YOUR-SHOP.example/collections/all
+            url_title: View all
+mode: queued
+```
+
+At most 10 products are announced individually. If there are more, a summary notification with a link to the full catalogue follows.
+
+---
+
+## Testing
+
+**Check the script directly** (terminal/SSH):
+
+```bash
+python3 /config/scripts/tswift_merch.py
+```
+
+The JSON output shows `new_since_last_run` and `error`.
+
+**Trigger a notification:** Remove two entries from `known.json` and let the sensor update. Do **not** run the script yourself in between, otherwise the entries are added straight back.
+
+```bash
+python3 -c "import json;p='/config/tswift_merch/known.json';k=json.load(open(p));[k.pop(i) for i in list(k)[:2]];json.dump(k,open(p,'w'))"
+```
+
+Then run the action `homeassistant.update_entity` with `entity_id: sensor.taylor_swift_merch` under *Developer tools → Actions*. The automation should fire and send two notifications. On the next run the list is empty again, which is intended.
+
+---
+
+## Troubleshooting
+
+| Problem | Cause and fix |
+|---|---|
+| `400: message cannot be blank` | The automation was started manually although nothing new was found. Use the test above instead. |
+| `Attachment path … is not allowed` | `allowlist_external_dirs` is missing or Home Assistant was not fully restarted. |
+| Unknown action `downloader.download_file` | The **Downloader** integration is not set up. |
+| Nothing happens after deleting from `known.json` | The JSON became invalid through manual editing. The script treats that as a first run and reports nothing. Use the one-liner above. |
+| `error` is filled in the sensor | The shop was unreachable. The script then returns the last good state and reports nothing new. |
+| No images in the Companion App | On iOS, the image only shows after pulling down or long-pressing the notification. |
+
+---
+
+## Notes
+
+- The script only accesses public shop data. Not every shop exposes `products.json`.
+- Prices are shown as delivered by the shop (in the example, in EUR).
+- For shops with a very large catalogue, a run takes longer. In that case increase `command_timeout`.
+
+## License
+
+Choose a license, e.g. MIT, and add it as `LICENSE`.
